@@ -1,0 +1,18 @@
+Prerequisites now: curl, jq, ssh (all pre-installed on macOS)
+
+Install:
+
+chmod +x ~/cli-ss
+# Put it somewhere on PATH:
+cp ~/cli-ss ~/bin/cli-ss   # (add ~/bin to PATH in ~/.zshrc if needed)
+Setup:
+
+export SS_HOST="https://your-secret-server.example.com/ss"
+export SS_USER="your-username"
+export SS_PASS="your-password"
+Use:
+
+cli-ss auth login          # interactive login
+cli-ss search webserver    # find secrets
+cli-ss ssh webserver       # SSH (password, no sshpass)
+cli-ss ssh-key webserver   # SSH (private key from secret)
