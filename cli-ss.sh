@@ -3,12 +3,16 @@
 # Usage:
 #   cli-ss auth login              # interactive login
 #   cli-ss auth token              # show current token info
+#   cli-ss templates               # list available secret templates
+#   cli-ss templates <templateId>  # show fields for a template
 #   cli-ss search <keyword>        # search secrets by name
 #   cli-ss get <keyword>           # show secret fields for first match
 #   cli-ss ssh <servername>        # SSH into a server (password via keyboard-interactive)
 #   cli-ss ssh-key <servername>    # SSH using a private key from the secret
 #   cli-ss passwd <servername>     # print password to stdout
 #   cli-ss key <servername>        # print private key to stdout
+#   cli-ss create                  # create a new secret from a template
+#   cli-ss delete <keyword>        # delete a secret by search match
 #   cli-ss logout                  # clear cached token
 #
 # Environment variables:
@@ -40,12 +44,16 @@ cli-ss — Delinea Secret Server CLI
 Usage:
   cli-ss auth login              Interactive login (stores token)
   cli-ss auth token              Show current token expiry
+  cli-ss templates               List all secret templates
+  cli-ss templates <templateId>  Show fields required by a template
   cli-ss search <keyword>        Search secrets by name
   cli-ss get <keyword>           Show all fields of first match
   cli-ss ssh <servername>        SSH into a server (password via keyboard-interactive)
   cli-ss ssh-key <servername>    SSH using a private key from the secret
   cli-ss passwd <servername>     Print password to stdout
   cli-ss key <servername>        Print private key to stdout
+  cli-ss create                  Create a new secret from a template
+  cli-ss delete <keyword>        Delete a secret by search match
   cli-ss logout                  Clear cached token
 
 Environment variables:
@@ -226,6 +234,277 @@ cmd_auth_token() {
         fi
     fi
 }
+
+# ─── Templates ────────────────────────────────────────────────────────────────
+
+cmd_templates() {
+    local token
+    token=$(get_token)
+
+    if [[ $# -gt 0 && "$1" != "--help" ]]; then
+        # Show fields for a specific template
+        local tid="$1"
+        local url="${SS_HOST%/}/api/v1/secret-templates/${tid}/fields"
+        local resp
+        resp=$(curl -s -f "${url}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" 2>&1) || {
+            echo "Failed to fetch template fields for ID ${tid}. Response: $resp" >&2
+            exit 1
+        }
+
+        local name
+        name=$(echo "$resp" | jq -r '.name // "unknown"')
+        echo "=== Template: ${name} (ID: ${tid}) ==="
+        echo ""
+        echo "$resp" | jq -r '.fields[] | "  [\(.fieldId)] \(.name) (\(.slug)) — \(.type)  \(.description // "")"' 2>/dev/null
+
+        # Also show the stub format needed to create secrets with this template
+        echo ""
+        echo "Stub structure for create:"
+        local stub
+        stub=$(curl -s -f "${SS_HOST%/}/api/v1/secrets/stub?filter.secrettemplateid=${tid}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" 2>&1) || {
+            echo "Failed to fetch stub." >&2
+            exit 1
+        }
+        echo "$stub" | jq '.items[] | {fieldId, name: .fieldName, slug, type: .type}' 2>/dev/null
+
+    else
+        # List all templates
+        local url="${SS_HOST%/}/api/v1/secret-templates"
+        local resp
+        resp=$(curl -s -f "${url}?filter.includeinactive=true" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/json" 2>&1) || {
+            echo "Failed to fetch templates. Response: $resp" >&2
+            exit 1
+        }
+
+        echo "Available secret templates:"
+        echo ""
+        printf "%-6s %-40s %-15s\n" "ID" "NAME" "RECORDS"
+        printf "%-6s %-40s %-15s\n" "------" "----------------------------------------" "-------"
+
+        echo "$resp" | jq -r '.records[] | "\(.id)\t\(.name)\t\(.secretRecordCount // 0)"' 2>/dev/null | while IFS=$'\t' read -r tid tname tcount; do
+            printf "%-6s %-40s %-15s\n" "$tid" "${tname:0:40}" "$tcount"
+        done
+    fi
+}
+
+# ─── Create ───────────────────────────────────────────────────────────────────
+
+cmd_create() {
+    local name="" tid="" fid=""
+    local -A field_vals=()
+    local gen_password=false
+    local prompt_user=true
+
+    # Parse args: --name, --template, --folder, --fields, --password, --no-prompt
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     name="$2"; shift 2 ;;
+            --template) tid="$2"; shift 2 ;;
+            --folder)   fid="$2"; shift 2 ;;
+            --fields)
+                IFS=',' read -ra pairs <<< "$2"
+                for pair in "${pairs[@]}"; do
+                    local key="${pair%%=*}"
+                    local val="${pair#*=}"
+                    field_vals["$key"]="$val"
+                done
+                shift 2 ;;
+            --password)
+                if [[ "$2" == "gen" || "$2" == "generate" ]]; then
+                    gen_password=true
+                    shift 2
+                elif [[ "$2" == "auto" ]]; then
+                    gen_password=true
+                    shift 2
+                else
+                    echo "Usage: cli-ss create --password gen|auto" >&2
+                    exit 1
+                fi
+                ;;
+            --no-prompt)
+                prompt_user=false
+                shift ;;
+            --help|-h)
+                cat <<'EOF'
+cli-ss create — Create a new secret from a template
+
+Usage:
+  cli-ss create --name "My Secret" --template 6001 [options]
+
+Options:
+  --name <name>          Secret display name (required)
+  --template <id>        Secret template ID (required; use 'cli-ss templates' to list)
+  --folder <id>          Folder ID (optional, defaults to template default)
+  --fields <k=v,...>     Field values as comma-separated key=value pairs.
+                         Keys can be field names (e.g. "Username=admin,Password=s3cret")
+                         or field slugs.
+  --password gen|auto    Auto-generate passwords for all password-type fields.
+  --no-prompt            Skip interactive prompts; fail if fields missing.
+  --help                 Show this help.
+
+Examples:
+  cli-ss create --name "web01" --template 6001 --fields "Username=admin,Password=mypass"
+  cli-ss create --name "db01" --template 6001 --password gen
+  cli-ss create --name "host01" --template 6001 --fields "Hostname=10.0.0.1" --password gen
+EOF
+                exit 0
+                ;;
+            *)
+                err "Unknown option '$1'. Run 'cli-ss create --help' for usage." ;;
+        esac
+    done
+
+    [[ -z "$name" ]] && err "--name is required"
+    [[ -z "$tid" ]] && err "--template is required (use 'cli-ss templates' to list)"
+
+    # Fetch stub for the template
+    local token
+    token=$(get_token)
+    local stub
+    stub=$(curl -s -f "${SS_HOST%/}/api/v1/secrets/stub?filter.secrettemplateid=${tid}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" 2>&1) || {
+        echo "Failed to fetch template stub for ID ${tid}. Response: $stub" >&2
+        exit 1
+    }
+
+    local folder_id
+    folder_id=$(echo "$stub" | jq -r '.folderId // empty' 2>/dev/null)
+    [[ -z "$folder_id" ]] && folder_id="${fid}"
+    [[ -z "$folder_id" ]] && {
+        read -rp "Folder ID (default 1): " folder_id
+        folder_id="${folder_id:-1}"
+    }
+
+    # Build field name->slug mapping and collect field details
+    declare -A slug_type=()
+    declare -A slug_fname=()
+    declare -a field_slugs=()
+    while IFS=$'\t' read -r s t n; do
+        slug_type["$s"]="$t"
+        slug_fname["$s"]="$n"
+        field_slugs+=("$s")
+    done < <(echo "$stub" | jq -r '.items[] | "\(.slug)\t\(.type // "string")\t\(.fieldName)"' 2>/dev/null)
+
+    # Collect values for each field
+    local -A resolved=()
+    for slug in "${field_slugs[@]}"; do
+        # Check if user provided a value (by slug or by field name lookup)
+        local val="${field_vals[$slug]:-}"
+        if [[ -z "$val" ]]; then
+            # Try matching by field name from stub
+            local fname="${slug_fname[$slug]:-}"
+            val="${field_vals[$fname]:-}"
+        fi
+
+        if [[ -z "$val" ]]; then
+            # Auto-generate passwords if requested
+            if $gen_password; then
+                local stype="${slug_type[$slug]:-}"
+                if [[ "$stype" == *"password"* ]]; then
+                    val=$(openssl rand -base64 16 2>/dev/null | tr -d '+/\n=' | head -c 20)
+                fi
+            fi
+        fi
+
+        if [[ -z "$val" ]]; then
+            if $prompt_user; then
+                local fname="${slug_fname[$slug]:-${slug}}"
+                local stype="${slug_type[$slug]:-string}"
+                local prompt_text="${fname}:"
+                if [[ "$stype" == *"password"* ]]; then
+                    read -rsp "  ${prompt_text} : " val
+                    echo
+                else
+                    read -rp "  ${prompt_text} : " val
+                fi
+            else
+                err "No value provided for field '${slug}' and --no-prompt is set"
+            fi
+        fi
+        resolved["$slug"]="$val"
+    done
+
+    # Build JSON payload from stub, replacing itemValues with user-provided values
+    # Create the resolved values JSON object for jq
+    local resolved_json="{}"
+    for slug in "${field_slugs[@]}"; do
+        resolved_json=$(echo "$resolved_json" | jq --arg k "$slug" --arg v "${resolved[$slug]}" '. + {($k): $v}')
+    done
+
+    local payload
+    payload=$(echo "$stub" | jq \
+        --arg name "$name" \
+        --arg folder "$folder_id" \
+        --arg tid "$tid" \
+        --argjson resolved "$resolved_json" \
+        '
+        .name = $name |
+        .secretTemplateId = ($tid | tonumber) |
+        .folderId = ($folder | tonumber) |
+        .SiteId = 1 |
+        .items = [.items[] | .itemValue = ($resolved[.slug] // .itemValue)]
+    ')
+
+    # Create the secret
+    local url="${SS_HOST%/}/api/v1/secrets"
+    local resp
+    resp=$(curl -s -f -X POST "${url}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>&1) || {
+        echo "Failed to create secret. Response: $resp" >&2
+        exit 1
+    }
+
+    local new_id
+    new_id=$(echo "$resp" | jq -r '.id')
+    local new_name
+    new_name=$(echo "$resp" | jq -r '.displayname')
+
+    echo "Created secret: ${new_name} (ID: ${new_id})"
+    echo "  Template:    ${tid}"
+    echo "  Folder:      ${folder_id}"
+    echo "  Name:        ${name}"
+}
+
+# ─── Delete ───────────────────────────────────────────────────────────────────
+
+cmd_delete() {
+    local keyword="${1:-}"
+    [[ -z "$keyword" ]] && err "Usage: cli-ss delete <keyword>"
+
+    local sid name
+    sid=$(search_secrets "$keyword" | head -1 | cut -f1)
+    [[ -z "$sid" ]] && err "No secret found matching '${keyword}'"
+
+    name=$(search_secrets "$keyword" | head -1 | cut -f2)
+
+    read -rp "Are you sure you want to delete '${name}' (ID: ${sid})? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+
+    local token
+    token=$(get_token)
+
+    local url="${SS_HOST%/}/api/v1/secrets/${sid}"
+    local resp
+    resp=$(curl -s -f -X DELETE "${url}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" 2>&1) || {
+        echo "Failed to delete secret ${sid}. Response: $resp" >&2
+        exit 1
+    }
+
+    echo "Deleted: ${name} (ID: ${sid})"
+}
+
+# ─── Existing commands ────────────────────────────────────────────────────────
 
 cmd_search() {
     local keyword="${1:-}"
@@ -431,13 +710,16 @@ case "$COMMAND" in
             *)      echo "Usage: cli-ss auth {login|token}" >&2; exit 1 ;;
         esac
         ;;
-    search)   cmd_search "$@" ;;
-    get)      cmd_get "$@" ;;
-    ssh)      cmd_ssh "$@" ;;
-    ssh-key)  cmd_ssh_key "$@" ;;
-    passwd)   cmd_passwd "$@" ;;
-    key)      cmd_key "$@" ;;
-    logout)   cmd_logout ;;
+    templates)  cmd_templates "$@" ;;
+    create)     cmd_create "$@" ;;
+    search)     cmd_search "$@" ;;
+    get)        cmd_get "$@" ;;
+    ssh)        cmd_ssh "$@" ;;
+    ssh-key)    cmd_ssh_key "$@" ;;
+    passwd)     cmd_passwd "$@" ;;
+    key)        cmd_key "$@" ;;
+    delete)     cmd_delete "$@" ;;
+    logout)     cmd_logout ;;
     help|--help|-h) cmd_help ;;
     *)
         err "Unknown command '${COMMAND}'. Run 'cli-ss help' for usage."
