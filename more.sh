@@ -4,6 +4,40 @@ TOKEN="AgIYgipII47eqZk-ctYV-pIeam7UDthScYN5vkeY0a26uSxqZVvllYhyeUTqQvvs9fUq1ij_0
 
 SS_URL="https://secretserver.example.com/SecretServer"
 
+#!/bin/bash
+# Environment settings
+SS_URL="https://secretserver.example.com/SecretServer"   # <-- change this
+USERNAME="username"
+PASSWORD='pasword123'          # single quotes so $$ is literal
+DOMAIN="domain.local"          # set to "" if not needed
+
+COMMAND="${1:-help}"
+
+# Get a fresh token (prompts for 6-digit OTP)
+get_token() {
+    local otp
+    read -r -p "Enter 6-digit OTP: " otp
+
+    # Try with domain first; fall back to plain username if you prefer
+    local full_user="${DOMAIN:+${DOMAIN}\\}${USERNAME}"
+
+    local response
+    response=$(curl -sk -X POST \
+        "$SS_URL/oauth2/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -H "OTP: $otp" \
+        -d "username=${full_user}" \
+        -d "password=${PASSWORD}" \
+        -d "grant_type=password")
+
+    TOKEN=$(echo "$response" | jq -r '.access_token // empty')
+
+    if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+        echo "Failed to get token. Response was:" >&2
+        echo "$response" >&2
+        exit 1
+    fi
+}
 COMMAND="${1:-help}"
 
 #this was only bringing back the first one in the list great if you know the exact hostname but otherwise useless
@@ -75,8 +109,9 @@ usage() {
 ss-cli — Delinea Secret Server CLI
 
 Usage:
-  cli-ss search <keyword>        Search secrets by name
-  cli-ss passwd <servername>     Print password to stdout
+  ss-cli token <OTP>             get your token 
+  ss-cli search <keyword>        Search secrets by name
+  ss-cli passwd <servername>     Print password to stdout
 
 
 Prerequisites:
@@ -98,6 +133,7 @@ cmd_help() {
 
 #Main Case statement
 case "$COMMAND" in
+    token) get_token "$@" ;;
     search)   cmd_search "$@" ;;
     passwd)   cmd_passwd "$@" ;;
     help|--help|-h) cmd_help ;;
